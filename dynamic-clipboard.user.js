@@ -7,8 +7,8 @@
 // @match        *://*/*
 // @run-at       document-end
 // @connect      none
-// @updateURL   https://raw.githubusercontent.com/your-org/repo/main/dynamic-clipboard.user.js
-// @downloadURL https://raw.githubusercontent.com/your-org/repo/main/dynamic-clipboard.user.js
+// @updateURL   https://github.com/lwhitemyo/dynamic-clipboard/raw/refs/heads/main/dynamic-clipboard.user.js
+// @downloadURL https://github.com/lwhitemyo/dynamic-clipboard/raw/refs/heads/main/dynamic-clipboard.user.js
 // @noframes
 // ==/UserScript==
 
