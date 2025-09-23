@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dynamic Clipboard (CSV/TSV → fast copy)
 // @namespace    https://your-org.example
-// @version      1.3.5
+// @version      1.3.4
 // @description  Paste CSV or spreadsheet (TSV) once, then copy field-by-field with one click / hotkeys while you move through web forms. No storage by default; optional session keep. GDPR-friendly.
 // @author       you
 // @match        *://*/*
@@ -26,17 +26,26 @@
   let index = 0;        // current record
   let copyCycle = [];   // order + subset of columns to cycle through
   let cyclePtr = 0;     // pointer in copyCycle
-  let hotkeysWorkInInputs = false;
+  let hotkeysWorkInInputs = true; // default ON
   let activeDelimiter = ','; // inferred or chosen
-  let keepOnReload = false;  // opt-in session persistence
-  let formURL = '';          // optional quick-return URL (in-memory)
+  let keepOnReload = true;   // default ON (pre-ticked)
+  let formURL = '';          // optional quick-return URL (persisted in session)
+
+  // Remembered panel position (for clean minimize/restore)
+  let lastLeft = null, lastTop = null;
 
   // ---------- SESSION KEEP (opt-in) ----------
   const MARK = '||DC='; // appended to window.name
   function saveSession() {
     if (!keepOnReload) return;
     try {
-      const payload = { v:1, delimiter: activeDelimiter, columns, rows, index, copyCycle };
+      const payload = {
+        v: 2,                       // payload version
+        delimiter: activeDelimiter,
+        columns, rows, index, copyCycle,
+        formURL,                    // persist form URL
+        hotkeysWorkInInputs         // persist hotkey pref
+      };
       const enc = encodeURIComponent(JSON.stringify(payload));
       const base = (page.name || '').split(MARK)[0] || '';
       page.name = base + MARK + enc;
@@ -50,13 +59,21 @@
       const enc = wn.slice(i + MARK.length);
       if (!enc) return false;
       const payload = JSON.parse(decodeURIComponent(enc));
-      if (!payload || payload.v !== 1) return false;
+      if (!payload || (payload.v !== 1 && payload.v !== 2)) return false;
+
       activeDelimiter = payload.delimiter || ',';
       columns = Array.isArray(payload.columns) ? payload.columns : [];
       rows = Array.isArray(payload.rows) ? payload.rows : [];
       index = Math.min(Math.max(0, payload.index|0), Math.max(0, rows.length-1));
       copyCycle = Array.isArray(payload.copyCycle) && payload.copyCycle.length ? payload.copyCycle : [...columns];
-      return rows.length > 0;
+
+      // v2 fields (safe defaults for v1)
+      formURL = typeof payload.formURL === 'string' ? payload.formURL : '';
+      if (typeof payload.hotkeysWorkInInputs === 'boolean') {
+        hotkeysWorkInInputs = payload.hotkeysWorkInInputs;
+      }
+
+      return rows.length > 0 || !!formURL;
     } catch { return false; }
   }
 
@@ -164,7 +181,7 @@
       /* Compact minimize icon */
       .iconBtn {
         position: fixed;
-        inset: auto 16px 16px auto; /* top-right default; adjust when minimizing */
+        inset: auto 16px 16px auto;
         z-index: 2147483647;
         width: 36px;
         height: 36px;
@@ -236,7 +253,13 @@
         panel.style.top = (py + dy) + 'px';
         panel.style.left = (px + dx) + 'px';
       });
-      window.addEventListener('mouseup', ()=> dragging = false);
+      window.addEventListener('mouseup', ()=> {
+        if (!dragging) return;
+        dragging = false;
+        const r = panel.getBoundingClientRect();
+        lastLeft = r.left;
+        lastTop  = r.top;
+      });
     })();
 
     const bodyEl = panel.querySelector('#body');
@@ -245,9 +268,11 @@
     const chkKeep = panel.querySelector('#chkKeep');
     const formUrlEl = panel.querySelector('#formUrl');
 
-    // initialize from restore
+    // initialize from defaults/session
+    chkInputs.checked = !!hotkeysWorkInInputs;   // default ON, overridden by session if present
+    chkKeep.checked = !!keepOnReload;            // default ON
     if (restored) {
-      keepOnReload = true; chkKeep.checked = true;
+      formUrlEl.value = formURL || '';
     }
 
     function setMeta(text) { metaEl.textContent = text; }
@@ -271,50 +296,49 @@
         empty.innerHTML = `Paste CSV or copy from Sheets/Excel (TSV). First row should be headers.<div class="sep"></div>
           <div class="pill">Tips: Alt+Q copy-next · Alt+N next · Alt+P prev</div>`;
         bodyEl.appendChild(empty);
-        return;
-      }
+      } else {
+        // Reorder pill (draggable chips)
+        if (copyCycle.length) {
+          const orderWrap = document.createElement('div'); orderWrap.className = 'order';
+          copyCycle.forEach((col, idx) => {
+            const chip = document.createElement('div'); chip.className = 'chip'; chip.draggable = true; chip.dataset.idx = String(idx);
+            chip.innerHTML = `<span>${col}</span><button class="x" title="Remove">×</button>`;
+            chip.addEventListener('dragstart', e => { e.dataTransfer.setData('text/plain', idx.toString()); });
+            chip.addEventListener('dragover', e => { e.preventDefault(); });
+            chip.addEventListener('drop', e => {
+              e.preventDefault();
+              const from = parseInt(e.dataTransfer.getData('text/plain')||'-1',10); const to = idx;
+              if (from>=0 && from!==to){ const item = copyCycle.splice(from,1)[0]; copyCycle.splice(to,0,item); cyclePtr = 0; saveSession(); render(); }
+            });
+            chip.querySelector('.x').addEventListener('click', () => {
+              const pos = copyCycle.indexOf(col);
+              if (pos!==-1){ copyCycle.splice(pos,1); cyclePtr=0; saveSession(); render(); }
+            });
+            orderWrap.appendChild(chip);
+          });
+          bodyEl.appendChild(orderWrap);
+        }
 
-      // Reorder pill (draggable chips)
-      if (copyCycle.length) {
-        const orderWrap = document.createElement('div'); orderWrap.className = 'order';
-        copyCycle.forEach((col, idx) => {
-          const chip = document.createElement('div'); chip.className = 'chip'; chip.draggable = true; chip.dataset.idx = String(idx);
-          chip.innerHTML = `<span>${col}</span><button class="x" title="Remove">×</button>`;
-          chip.addEventListener('dragstart', e => { e.dataTransfer.setData('text/plain', idx.toString()); });
-          chip.addEventListener('dragover', e => { e.preventDefault(); });
-          chip.addEventListener('drop', e => {
-            e.preventDefault();
-            const from = parseInt(e.dataTransfer.getData('text/plain')||'-1',10); const to = idx;
-            if (from>=0 && from!==to){ const item = copyCycle.splice(from,1)[0]; copyCycle.splice(to,0,item); cyclePtr = 0; saveSession(); render(); }
-          });
-          chip.querySelector('.x').addEventListener('click', () => {
-            const pos = copyCycle.indexOf(col);
-            if (pos!==-1){ copyCycle.splice(pos,1); cyclePtr=0; saveSession(); render(); }
-          });
-          orderWrap.appendChild(chip);
+        const rec = rows[index];
+        columns.forEach(col => {
+          const rowEl = document.createElement('div'); rowEl.className = 'row';
+          const label = document.createElement('div'); label.className = 'label'; label.textContent = col;
+          const right = document.createElement('div'); right.style.display = 'flex'; right.style.gap = '6px'; right.style.alignItems = 'center';
+          const val = document.createElement('div'); val.className = 'val'; val.textContent = rec[col] ?? '';
+          const btn = document.createElement('button'); btn.className = 'btn'; btn.textContent = 'Copy';
+          btn.addEventListener('click', async () => { const ok = await writeClipboard(rec[col] ?? ''); flash(btn, ok); });
+
+          // star toggles inclusion in copyCycle
+          const star = document.createElement('button'); star.className = 'btn'; star.textContent = copyCycle.includes(col) ? '★' : '☆'; star.title = copyCycle.includes(col) ? 'Remove from copy order' : 'Add to copy order';
+          star.addEventListener('click', () => { const pos = copyCycle.indexOf(col); if (pos === -1) copyCycle.push(col); else copyCycle.splice(pos,1); cyclePtr = 0; saveSession(); render(); });
+
+          right.appendChild(val); right.appendChild(btn); right.appendChild(star);
+          rowEl.appendChild(label); rowEl.appendChild(right);
+          bodyEl.appendChild(rowEl);
         });
-        bodyEl.appendChild(orderWrap);
       }
 
-      const rec = rows[index];
-      columns.forEach(col => {
-        const rowEl = document.createElement('div'); rowEl.className = 'row';
-        const label = document.createElement('div'); label.className = 'label'; label.textContent = col;
-        const right = document.createElement('div'); right.style.display = 'flex'; right.style.gap = '6px'; right.style.alignItems = 'center';
-        const val = document.createElement('div'); val.className = 'val'; val.textContent = rec[col] ?? '';
-        const btn = document.createElement('button'); btn.className = 'btn'; btn.textContent = 'Copy';
-        btn.addEventListener('click', async () => { const ok = await writeClipboard(rec[col] ?? ''); flash(btn, ok); });
-
-        // star now toggles inclusion in copyCycle (keep for convenience)
-        const star = document.createElement('button'); star.className = 'btn'; star.textContent = copyCycle.includes(col) ? '★' : '☆'; star.title = copyCycle.includes(col) ? 'Remove from copy order' : 'Add to copy order';
-        star.addEventListener('click', () => { const pos = copyCycle.indexOf(col); if (pos === -1) copyCycle.push(col); else copyCycle.splice(pos,1); cyclePtr = 0; saveSession(); render(); });
-
-        right.appendChild(val); right.appendChild(btn); right.appendChild(star);
-        rowEl.appendChild(label); rowEl.appendChild(right);
-        bodyEl.appendChild(rowEl);
-      });
-
-      setMeta(`Record ${index + 1} of ${rows.length} • Delimiter: ${humanDelim(activeDelimiter)}`);
+      setMeta(`Record ${rows.length ? (index + 1) : 0} of ${rows.length} • Delimiter: ${humanDelim(activeDelimiter)}`);
     }
 
     function flash(btn, ok) { const orig = btn.textContent; btn.textContent = ok ? 'Copied!' : 'Copy failed'; btn.disabled = true; setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 700); }
@@ -326,7 +350,6 @@
       const text = rec[col] ?? '';
       await writeClipboard(text);
       cyclePtr++;
-      // flash the button for that row if present
       const rowsEls = bodyEl.querySelectorAll('.row');
       rowsEls.forEach(r => { if (r.firstChild && r.firstChild.textContent === col) { const btn = r.querySelector('.btn'); if (btn) flash(btn, true); } });
     }
@@ -334,41 +357,75 @@
     function next() { if (index < rows.length - 1) { index++; cyclePtr = 0; saveSession(); render(); } }
     function prev() { if (index > 0) { index--; cyclePtr = 0; saveSession(); render(); } }
 
-    // Minimize to compact icon (📋). Keep position consistent.
-    function positionMiniNearPanel() {
+    // Minimize to compact icon (📋). Keep/restore exact position.
+    panel.querySelector('#btnMin').addEventListener('click', () => {
       const r = panel.getBoundingClientRect();
-      // put icon near top-right of the card, but inside viewport
-      mini.style.left = Math.min(Math.max(r.right - 44, 8), (window.innerWidth - 44)) + 'px';
-      mini.style.top  = Math.min(Math.max(r.top + 8, 8), (window.innerHeight - 44)) + 'px';
+      lastLeft = r.left;
+      lastTop  = r.top;
+      // park mini near where the panel was
+      mini.style.left = Math.min(Math.max(r.right - 44, 8), window.innerWidth - 44) + 'px';
+      mini.style.top  = Math.min(Math.max(r.top + 8, 8),    window.innerHeight - 44) + 'px';
       mini.style.right = 'auto';
       mini.style.bottom = 'auto';
-    }
-
-    panel.querySelector('#btnMin').addEventListener('click', () => {
-      positionMiniNearPanel();
       panel.style.display = 'none';
       mini.style.display = 'flex';
     });
+
     mini.addEventListener('click', () => {
-      // restore panel near where the icon is
-      const r = mini.getBoundingClientRect();
-      panel.style.left = (r.left - 8) + 'px';
-      panel.style.top  = (r.top - 8) + 'px';
+      // If we have a remembered panel position, use it; otherwise use mini’s spot
+      if (lastLeft == null || lastTop == null) {
+        const r = mini.getBoundingClientRect();
+        lastLeft = r.left - 8;
+        lastTop  = r.top  - 8;
+      }
+      panel.style.left = lastLeft + 'px';
+      panel.style.top  = lastTop  + 'px';
       panel.style.right = 'auto';
       panel.style.display = '';
       mini.style.display = 'none';
     });
 
-    // Keep icon on-screen when viewport changes
+    // Make the mini draggable (so you can move it while minimized)
+    (function makeMiniDraggable() {
+      let dragging = false, sx = 0, sy = 0, sl = 0, st = 0;
+      mini.addEventListener('mousedown', e => {
+        dragging = true;
+        sx = e.clientX; sy = e.clientY;
+        const r = mini.getBoundingClientRect();
+        sl = r.left; st = r.top;
+        e.preventDefault();
+      });
+      window.addEventListener('mousemove', e => {
+        if (!dragging) return;
+        const nx = Math.min(Math.max(sl + (e.clientX - sx), 8), window.innerWidth - 44);
+        const ny = Math.min(Math.max(st + (e.clientY - sy), 8), window.innerHeight - 44);
+        mini.style.left = nx + 'px';
+        mini.style.top  = ny + 'px';
+        mini.style.right = 'auto';
+        mini.style.bottom = 'auto';
+      });
+      window.addEventListener('mouseup', () => {
+        if (!dragging) return;
+        dragging = false;
+        // Update the panel’s remembered position so restore opens near the mini
+        const r = mini.getBoundingClientRect();
+        lastLeft = r.left - 8;
+        lastTop  = r.top  - 8;
+      });
+    })();
+
+    // Keep mini on-screen when viewport changes
     window.addEventListener('resize', () => {
       if (mini.style.display !== 'flex') return;
       const rect = mini.getBoundingClientRect();
-      // if it's off-screen, nudge back to corner
       if (rect.right > window.innerWidth || rect.bottom > window.innerHeight) {
         mini.style.left = (window.innerWidth - 44) + 'px';
         mini.style.top  =  '8px';
         mini.style.right = 'auto';
         mini.style.bottom = 'auto';
+        // Update remembered panel position accordingly
+        lastLeft = window.innerWidth - 52;
+        lastTop  = 0;
       }
     });
 
@@ -377,15 +434,22 @@
     panel.querySelector('#btnNext').addEventListener('click', next);
     panel.querySelector('#btnCycle').addEventListener('click', copyNextInCycle);
 
-    chkInputs.addEventListener('change', () => { hotkeysWorkInInputs = chkInputs.checked; });
+    // Persist prefs + URL as they change
+    chkInputs.addEventListener('change', () => {
+      hotkeysWorkInInputs = chkInputs.checked;
+      saveSession();
+    });
     chkKeep.addEventListener('change', () => {
       keepOnReload = chkKeep.checked;
       if (!keepOnReload) {
-        // remove our marker but keep any site-provided window.name
         try { const base = (page.name || '').split(MARK)[0] || ''; page.name = base; } catch {}
       } else {
         saveSession();
       }
+    });
+    formUrlEl.addEventListener('input', () => {
+      formURL = (formUrlEl.value || '').trim();
+      saveSession();
     });
 
     panel.querySelector('#btnOpenForm').addEventListener('click', () => {
