@@ -1,14 +1,14 @@
 // ==UserScript==
-// @name         Dynamic Clipboard (CSV/TSV → fast copy)
+// @name         Dynamic Clipboard (CSV/TSV → fast copy + auto-run)
 // @namespace    https://your-org.example
-// @version      1.3.4
-// @description  Paste CSV or spreadsheet (TSV) once, then copy field-by-field with one click / hotkeys while you move through web forms. No storage by default; optional session keep. GDPR-friendly.
+// @version      1.4.0
+// @description  Paste CSV/TSV once, then copy or auto-fill field-by-field (with hotkeys) as you move through web forms. Optional session keep. GDPR-friendly.
 // @author       you
 // @match        *://*/*
 // @run-at       document-end
 // @connect      none
-// @updateURL   https://github.com/lwhitemyo/dynamic-clipboard/raw/refs/heads/main/dynamic-clipboard.user.js
-// @downloadURL https://github.com/lwhitemyo/dynamic-clipboard/raw/refs/heads/main/dynamic-clipboard.user.js
+// @updateURL    https://github.com/lwhitemyo/dynamic-clipboard/raw/refs/heads/main/dynamic-clipboard.user.js
+// @downloadURL  https://github.com/lwhitemyo/dynamic-clipboard/raw/refs/heads/main/dynamic-clipboard.user.js
 // @noframes
 // ==/UserScript==
 
@@ -31,6 +31,11 @@
   let keepOnReload = true;   // default ON (pre-ticked)
   let formURL = '';          // optional quick-return URL (persisted in session)
 
+  // --- AUTO-RUN state ---
+  let autoRunning = false;
+  let autoDelayMs = 140; // delay between fields; tune for slow pages/react
+  let autoStopRequested = false;
+
   // Remembered panel position (for clean minimize/restore)
   let lastLeft = null, lastTop = null;
 
@@ -45,6 +50,7 @@
         columns, rows, index, copyCycle,
         formURL,                    // persist form URL
         hotkeysWorkInInputs         // persist hotkey pref
+        // (autoDelayMs not persisted to keep payload minimal; easy to add)
       };
       const enc = encodeURIComponent(JSON.stringify(payload));
       const base = (page.name || '').split(MARK)[0] || '';
@@ -135,6 +141,68 @@
     }
   }
 
+  // ---------- AUTO-RUN HELPERS ----------
+  function isVisible(el) {
+    const r = el.getBoundingClientRect();
+    const style = el.ownerDocument.defaultView.getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  }
+  function isFocusable(el) {
+    if (!el || !isVisible(el) || el.disabled) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    if (el.isContentEditable) return true;
+    if (['input', 'textarea', 'select', 'button'].includes(tag)) return true;
+    const ti = el.getAttribute('tabindex');
+    return ti !== null && parseInt(ti,10) >= 0;
+  }
+  function getTabbables(rootDoc = document) {
+    const nodes = Array.from(rootDoc.querySelectorAll(
+      'a[href], button, input, select, textarea, [tabindex], [contenteditable], [contenteditable=""], [contenteditable="true"], [contenteditable="plaintext-only"]'
+    ));
+    return nodes.filter(isFocusable);
+  }
+  // React/Angular/Vue-friendly value setter
+  function setFormValue(el, value) {
+    const tag = (el.tagName || '').toLowerCase();
+    if (el.isContentEditable) {
+      el.focus();
+      el.innerText = value ?? '';
+      el.dispatchEvent(new InputEvent('input', {bubbles:true}));
+      el.dispatchEvent(new Event('change', {bubbles:true}));
+      return;
+    }
+    if (tag === 'select') {
+      const v = value ?? '';
+      let matched = false;
+      for (const opt of el.options) {
+        if (opt.value === v || opt.text === v) { opt.selected = true; matched = true; break; }
+      }
+      if (!matched) el.value = v;
+      el.dispatchEvent(new Event('input', {bubbles:true}));
+      el.dispatchEvent(new Event('change', {bubbles:true}));
+      return;
+    }
+    // inputs & textareas
+    const proto = tag === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (desc && desc.set) desc.set.call(el, value ?? '');
+    else el.value = value ?? '';
+    el.dispatchEvent(new Event('input', {bubbles:true}));
+    el.dispatchEvent(new Event('change', {bubbles:true}));
+  }
+  function focusNextFrom(current, all) {
+    const idx = Math.max(0, all.indexOf(current));
+    for (let i = idx + 1; i < all.length; i++) {
+      const el = all[i];
+      if (isFocusable(el)) { el.focus(); return el; }
+    }
+    return null;
+  }
+  function currentActive() {
+    const el = document.activeElement;
+    return (el && el !== document.body) ? el : null;
+  }
+
   // ---------- MOUNT ----------
   function mounted() { return document.getElementById('dcsv-root'); }
   function safeMount() {
@@ -215,6 +283,7 @@
           <div class="controls">
             <button class="btn" id="btnPaste">Paste CSV / TSV</button>
             <button class="btn" id="btnCycle">Copy-next <span class="kbd">Alt+Q</span></button>
+            <button class="btn" id="btnAuto">Auto-run <span class="kbd">Alt+A</span></button>
             <button class="btn warn" id="btnClear" title="Clear CSV data from memory">Clear all</button>
             <button class="btn" id="btnMin" title="Minimise">—</button>
           </div>
@@ -227,6 +296,10 @@
               <label class="chk"><input type="checkbox" id="chkInputs"/> Hotkeys work in inputs</label>
               <label class="chk"><input type="checkbox" id="chkKeep"/> Keep data on reload (session)</label>
               <label class="chk">Form URL: <input id="formUrl" placeholder="https://…" style="border:1px solid #e5e7eb; padding:4px 6px; border-radius:6px; width:180px"/></label>
+              <label class="chk">Speed ms:
+                <input id="autoDelay" type="number" min="40" step="20" value="140"
+                  style="width:72px; border:1px solid #e5e7eb; padding:4px 6px; border-radius:6px"/>
+              </label>
               <button class="btn" id="btnOpenForm" title="Open form URL in this tab">Open</button>
             </div>
           </div>
@@ -267,6 +340,8 @@
     const chkInputs = panel.querySelector('#chkInputs');
     const chkKeep = panel.querySelector('#chkKeep');
     const formUrlEl = panel.querySelector('#formUrl');
+    const btnAuto = panel.querySelector('#btnAuto');
+    const autoDelayEl = panel.querySelector('#autoDelay');
 
     // initialize from defaults/session
     chkInputs.checked = !!hotkeysWorkInInputs;   // default ON, overridden by session if present
@@ -274,12 +349,15 @@
     if (restored) {
       formUrlEl.value = formURL || '';
     }
+    if (autoDelayEl) autoDelayEl.value = String(autoDelayMs);
 
     function setMeta(text) { metaEl.textContent = text; }
 
     function wipeAll() {
       rows = []; columns = []; index = 0; copyCycle = []; cyclePtr = 0; setMeta('Cleared. No data loaded'); saveSession(); render();
     }
+
+    function humanDelim(d) { return d === '	' ? 'Tab' : (d === ',' ? 'Comma' : d === ';' ? 'Semicolon' : d === '|' ? 'Pipe' : d); }
 
     function render() {
       bodyEl.innerHTML = '';
@@ -291,10 +369,12 @@
       btnPrev.disabled = index <= 0 || !rows.length;
       btnNext.disabled = index >= rows.length - 1 || !rows.length;
 
+      if (btnAuto) btnAuto.disabled = !rows.length || !copyCycle.length;
+
       if (!rows.length) {
         const empty = document.createElement('div'); empty.className = 'empty';
         empty.innerHTML = `Paste CSV or copy from Sheets/Excel (TSV). First row should be headers.<div class="sep"></div>
-          <div class="pill">Tips: Alt+Q copy-next · Alt+N next · Alt+P prev</div>`;
+          <div class="pill">Tips: Alt+Q copy-next · Alt+N next · Alt+P prev · Alt+A auto-run</div>`;
         bodyEl.appendChild(empty);
       } else {
         // Reorder pill (draggable chips)
@@ -356,6 +436,55 @@
 
     function next() { if (index < rows.length - 1) { index++; cyclePtr = 0; saveSession(); render(); } }
     function prev() { if (index > 0) { index--; cyclePtr = 0; saveSession(); render(); } }
+
+    // ---------- AUTO-RUN CORE ----------
+    async function autoRunOnce() {
+      if (!rows.length || !copyCycle.length) return false;
+      const col = copyCycle[cyclePtr % copyCycle.length];
+      const rec = rows[index];
+      const val = rec[col] ?? '';
+
+      // ensure we have a focused field; if not, focus the first tabbable
+      let active = currentActive();
+      let tabbables = getTabbables(document);
+      if (!active || !isFocusable(active)) {
+        active = tabbables[0];
+        if (active) active.focus();
+      }
+      if (!active) return false; // nowhere to put value
+
+      setFormValue(active, val);
+
+      // visual flash on matching row button
+      const rowsEls = bodyEl.querySelectorAll('.row');
+      rowsEls.forEach(r => { if (r.firstChild && r.firstChild.textContent === col) {
+        const btn = r.querySelector('.btn'); if (btn) flash(btn, true);
+      }});
+
+      cyclePtr++;
+      // move focus to next tabbable as if Tab was pressed
+      tabbables = getTabbables(document);
+      focusNextFrom(active, tabbables);
+      return true;
+    }
+
+    async function startAutoRun() {
+      if (autoRunning || !rows.length || !copyCycle.length) return;
+      cyclePtr = 0; // Always restart from first field when auto-run begins
+      autoRunning = true; autoStopRequested = false;
+      if (btnAuto) btnAuto.textContent = 'Stop';
+      try {
+        while (!autoStopRequested && cyclePtr < copyCycle.length) {
+          const ok = await autoRunOnce();
+          if (!ok) break;
+          await new Promise(r => setTimeout(r, autoDelayMs));
+        }
+      } finally {
+        autoRunning = false;
+        if (btnAuto) btnAuto.textContent = 'Auto-run';
+      }
+    }
+    function stopAutoRun() { autoStopRequested = true; }
 
     // Minimize to compact icon (📋). Keep/restore exact position.
     panel.querySelector('#btnMin').addEventListener('click', () => {
@@ -433,6 +562,10 @@
     panel.querySelector('#btnPrev').addEventListener('click', prev);
     panel.querySelector('#btnNext').addEventListener('click', next);
     panel.querySelector('#btnCycle').addEventListener('click', copyNextInCycle);
+    if (btnAuto) btnAuto.addEventListener('click', () => { autoRunning ? stopAutoRun() : startAutoRun(); });
+    if (autoDelayEl) autoDelayEl.addEventListener('change', () => {
+      autoDelayMs = Math.max(40, parseInt(autoDelayEl.value||'140',10) || 140);
+    });
 
     // Persist prefs + URL as they change
     chkInputs.addEventListener('change', () => {
@@ -472,7 +605,12 @@
         if (e.key === 'q' || e.key === 'Q') { e.preventDefault(); e.stopPropagation(); copyNextInCycle(); }
         if (e.key === 'n' || e.key === 'N') { e.preventDefault(); e.stopPropagation(); next(); }
         if (e.key === 'p' || e.key === 'P') { e.preventDefault(); e.stopPropagation(); prev(); }
+        if (e.key === 'a' || e.key === 'A') { e.preventDefault(); e.stopPropagation(); autoRunning ? stopAutoRun() : startAutoRun(); }
       }
+    }, true);
+    // Allow Esc to stop auto-run anytime
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && autoRunning) stopAutoRun();
     }, true);
 
     // Paste handler
@@ -485,8 +623,6 @@
       if (!data.length) { alert('No data rows found. Make sure the first row is a header.'); return; }
       rows = data; columns = cols; index = 0; copyCycle = [...columns]; cyclePtr = 0; render(); saveSession();
     });
-
-    function humanDelim(d) { return d === '	' ? 'Tab' : (d === ',' ? 'Comma' : d === ';' ? 'Semicolon' : d === '|' ? 'Pipe' : d); }
 
     function openPasteDialog(root) {
       const wrap = document.createElement('div'); wrap.style.position = 'fixed'; wrap.style.inset = '0'; wrap.style.zIndex = '2147483647'; wrap.style.background = 'rgba(0,0,0,.35)'; wrap.style.display = 'grid'; wrap.style.placeItems = 'center'; wrap.style.fontFamily = 'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial';
